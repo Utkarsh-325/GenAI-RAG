@@ -1,0 +1,36 @@
+# ── Web framework & UI ────────────────────────────────────────────────────────
+streamlit>=1.41.0
+
+# ── LangChain ecosystem (let pip resolve compatible versions together) ─────────
+langchain
+langchain-core
+langchain-community
+langchain-text-splitters
+langchain-groq
+langchain-huggingface
+langchain-qdrant
+
+# ── Groq SDK ──────────────────────────────────────────────────────────────────
+groq
+
+# ── Embeddings — HuggingFace (runs 100% locally) ─────────────────────────────
+sentence-transformers>=3.0.0
+transformers>=4.40.0
+
+# ── Vector store — Qdrant Cloud ───────────────────────────────────────────────
+qdrant-client>=1.9.0
+
+# ── PDF parsing ───────────────────────────────────────────────────────────────
+pymupdf>=1.24.0
+
+# ── Env management ────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+pydantic>=2.7.0
+httpx>=0.27.0
+numpy>=1.26.0
+
+# ── PyTorch (CPU only — install this FIRST separately to save ~700 MB) ────────
+# Run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+# Then: pip install -r requirements.txt
