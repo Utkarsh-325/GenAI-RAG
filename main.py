@@ -6,9 +6,11 @@ Run with:
 """
 
 import logging
+from urllib.parse import urlparse
 import streamlit as st
 
 import rag_engine
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -123,15 +125,33 @@ for msg in st.session_state.messages:
         st.markdown(f'<div class="user-bubble">🧑 {msg["content"]}</div>', unsafe_allow_html=True)
     else:
         st.markdown(f'<div class="assistant-bubble">🤖 {msg["content"]}</div>', unsafe_allow_html=True)
+        
+        # Render CRAG Steps
+        if msg.get("crag_steps"):
+            with st.expander("🛠️ Corrective RAG (CRAG) Execution Trace", expanded=False):
+                for step in msg["crag_steps"]:
+                    st.markdown(f"### {step['title']}")
+                    st.markdown(f"**Status:** `{step['status']}`")
+                    if step.get("details"):
+                        st.markdown(step["details"])
+                    st.markdown("---")
+                    
         if msg.get("sources"):
-            chips = "".join(
-                f'<span class="source-chip">📄 {s["file"]} · p.{s["page"]}</span>'
-                for s in msg["sources"]
-            )
-            st.markdown(f"<div style='margin-top:4px'>{chips}</div>", unsafe_allow_html=True)
+            chips = []
+            for s in msg["sources"]:
+                if s.get("url"):
+                    domain = urlparse(s["url"]).netloc
+                    chips.append(f'<span class="source-chip">🌐 <a href="{s["url"]}" target="_blank" style="color: inherit; text-decoration: none;">{domain}</a></span>')
+                else:
+                    chips.append(f'<span class="source-chip">📄 {s["file"]} · p.{s["page"]}</span>')
+            
+            st.markdown(f"<div style='margin-top:4px'>{''.join(chips)}</div>", unsafe_allow_html=True)
             with st.expander("View source snippets", expanded=False):
                 for i, s in enumerate(msg["sources"], 1):
-                    st.markdown(f"**[{i}] {s['file']} — page {s['page']}**")
+                    if s.get("url"):
+                        st.markdown(f"**[{i}] 🌐 [{s['file']}]({s['url']})**")
+                    else:
+                        st.markdown(f"**[{i}] 📄 {s['file']} — page {s['page']}**")
                     st.caption(s["snippet"] + " …")
 
 st.markdown("<br>", unsafe_allow_html=True)
@@ -168,5 +188,6 @@ if submitted and user_input.strip():
         "role": "assistant",
         "content": answer_data["answer"],
         "sources": answer_data["sources"],
+        "crag_steps": answer_data.get("crag_steps", []),
     })
     st.rerun()

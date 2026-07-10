@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import tempfile
+import json
 from pathlib import Path
 from typing import List
 
@@ -38,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 _embeddings: HuggingFaceEmbeddings | None = None
 _qdrant_client: QdrantClient | None = None
+qdrant_is_local: bool = False
 
 
 def _get_embeddings() -> HuggingFaceEmbeddings:
@@ -55,13 +57,27 @@ def _get_embeddings() -> HuggingFaceEmbeddings:
 
 def _get_qdrant_client() -> QdrantClient:
     """Return (or lazily create) the shared Qdrant client."""
-    global _qdrant_client
+    global _qdrant_client, qdrant_is_local
     if _qdrant_client is None:
-        logger.info("Connecting to Qdrant Cloud …")
-        _qdrant_client = QdrantClient(
-            url=config.get_qdrant_url(),
-            api_key=config.get_qdrant_api_key(),
-        )
+        try:
+            logger.info("Connecting to Qdrant Cloud …")
+            _qdrant_client = QdrantClient(
+                url=config.get_qdrant_url(),
+                api_key=config.get_qdrant_api_key(),
+                timeout=5.0,
+            )
+            # Test connection
+            _qdrant_client.get_collections()
+            qdrant_is_local = False
+            logger.info("Successfully connected to Qdrant Cloud.")
+        except Exception as e:
+            logger.warning(
+                "Failed to connect to Qdrant Cloud (%s). "
+                "Falling back to local in-memory Qdrant database.",
+                e
+            )
+            _qdrant_client = QdrantClient(path=":memory:")
+            qdrant_is_local = True
     return _qdrant_client
 
 
@@ -134,8 +150,7 @@ def index_documents(chunks: List[Document]) -> int:
     QdrantVectorStore.from_documents(
         documents=chunks,
         embedding=embeddings,
-        url=config.get_qdrant_url(),
-        api_key=config.get_qdrant_api_key(),
+        client=client,
         collection_name=config.QDRANT_COLLECTION,
         force_recreate=False,  # append to existing collection
     )
@@ -159,32 +174,233 @@ def retrieve_context(query: str) -> List[Document]:
     return results
 
 
+def grade_document(llm: ChatGroq, question: str, document_text: str) -> bool:
+    """
+    Grades a retrieved document's relevance to the user's question.
+    Returns True if relevant, False otherwise.
+    """
+    prompt = (
+        "You are an expert evaluator grading the relevance of a retrieved document to a user question.\n\n"
+        f"Here is the retrieved document:\n"
+        f"<document>\n{document_text}\n</document>\n\n"
+        f"Here is the user question:\n"
+        f"{question}\n\n"
+        "Evaluate if the document contains information that is directly relevant to or helps answer the user question.\n"
+        "Provide your feedback as a JSON object with a single key 'score' which must be either 'yes' or 'no' to indicate whether the document is relevant.\n"
+        "Do not explain or output anything else. Only output the raw JSON."
+    )
+    
+    try:
+        response = llm.invoke([
+            SystemMessage(content="You are a strict document grader. Output JSON only."),
+            HumanMessage(content=prompt)
+        ])
+        
+        content = response.content.strip()
+        # Clean any markdown block formatting if LLM generated it
+        if content.startswith("```json"):
+            content = content[7:]
+        if content.endswith("```"):
+            content = content[:-3]
+        content = content.strip()
+        
+        data = json.loads(content)
+        score = data.get("score", "no").strip().lower()
+        return score == "yes"
+    except Exception as e:
+        logger.error(f"Error grading document: {e}. Fallback to string check.")
+        text = response.content.lower() if 'response' in locals() else ""
+        if '"score": "yes"' in text or '"score":"yes"' in text or "yes" in text:
+            return True
+        return False
+
+
+def reformulate_query(llm: ChatGroq, question: str) -> str:
+    """
+    Optimizes/reformulates the user's question into a query suitable for web search.
+    """
+    prompt = (
+        "You are an expert search query optimizer. The user asked a question, but some retrieved local documents were irrelevant or insufficient.\n"
+        "Your task is to generate a single, highly effective search query that will be used to search the web for relevant information to answer the question.\n\n"
+        f"Original user question: {question}\n\n"
+        "Output only the optimized search query. Do not include any introduction, explanations, markdown formatting, or quotes."
+    )
+    try:
+        response = llm.invoke([
+            SystemMessage(content="You are a search query optimizer. Output ONLY the query string."),
+            HumanMessage(content=prompt)
+        ])
+        query = response.content.strip().strip('"').strip("'")
+        return query if query else question
+    except Exception as e:
+        logger.error(f"Error reformulating query: {e}")
+        return question
+
+
+def execute_web_search(query: str, max_results: int = 3) -> List[Document]:
+    """
+    Searches the web using DuckDuckGo and returns a list of LangChain Document objects.
+    """
+    from ddgs import DDGS
+    
+    logger.info("Executing DuckDuckGo web search for query: '%s' …", query)
+    documents = []
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+            for r in results:
+                title = r.get("title", "Web Page")
+                href = r.get("href", "#")
+                body = r.get("body", "")
+                
+                # Combine title and body as the content
+                content = f"Title: {title}\nURL: {href}\nContent: {body}"
+                
+                doc = Document(
+                    page_content=content,
+                    metadata={
+                        "source_file": f"Web: {href}",
+                        "page": "web",
+                        "title": title,
+                        "url": href
+                    }
+                )
+                documents.append(doc)
+    except Exception as e:
+        logger.error(f"Error in web search: {e}")
+    
+    logger.info("Retrieved %d web search result(s).", len(documents))
+    return documents
+
+
 def answer_question(question: str) -> dict:
     """
-    Full RAG query:
-      1. Retrieve relevant chunks.
-      2. Build a grounded prompt (system + context + question).
-      3. Call Groq LLM.
-      4. Return answer + source metadata.
+    Corrective RAG (CRAG) flow:
+      1. Retrieve relevant chunks from local vector store.
+      2. Grade retrieved chunks for relevance to the question.
+      3. If any chunks are irrelevant, reformulate the query and perform a web search.
+      4. Synthesize final response using relevant local chunks + web search results.
+      5. Return response, source list, and logs of CRAG steps.
     """
+    crag_steps = []
+    
+    # 1. Retrieval
+    crag_steps.append({
+        "title": "🔍 Retrieving local documents",
+        "status": "In progress...",
+        "details": f"Querying Qdrant index for question: '{question}'"
+    })
+    
     context_docs = retrieve_context(question)
-
-    if not context_docs:
-        return {
-            "answer": "No documents have been indexed yet. Please upload a PDF first.",
-            "sources": [],
-        }
-
-    # Concatenate chunk texts
-    context_text = "\n\n---\n\n".join(
-        f"[Chunk from '{doc.metadata.get('source_file', 'unknown')}', "
-        f"page {doc.metadata.get('page', '?')}]\n{doc.page_content}"
-        for doc in context_docs
+    
+    # Grader/Reformulator LLM
+    grader_llm = ChatGroq(
+        api_key=config.get_groq_api_key(),
+        model=config.LLM_MODEL,
+        temperature=config.CRAG_GRADER_TEMPERATURE,
     )
-
-    # Build messages
+    
+    if not context_docs:
+        # If no documents are in Qdrant at all, we fallback to web search entirely
+        crag_steps[-1]["status"] = "No local documents found"
+        crag_steps[-1]["details"] = "Qdrant collection is empty or no documents returned."
+        
+        web_query = reformulate_query(grader_llm, question)
+        crag_steps.append({
+            "title": "🌐 Web search fallback",
+            "status": "Searching...",
+            "details": f"No local documents found. Searching web for: '{web_query}'"
+        })
+        
+        web_docs = execute_web_search(web_query, max_results=config.WEB_SEARCH_MAX_RESULTS)
+        crag_steps[-1]["status"] = f"Found {len(web_docs)} web result(s)"
+        crag_steps[-1]["details"] = "\n\n".join(f"- [{d.metadata.get('title', 'Link')}]({d.metadata.get('url', '#')})" for d in web_docs)
+        
+        if not web_docs:
+            return {
+                "answer": "No local documents are indexed, and web search did not return any results. Please upload a document or ask a search-friendly question.",
+                "sources": [],
+                "crag_steps": crag_steps
+            }
+            
+        all_context_docs = web_docs
+    else:
+        crag_steps[-1]["status"] = f"Retrieved {len(context_docs)} document chunk(s)"
+        crag_steps[-1]["details"] = "\n\n".join(
+            f"- Chunk from `{doc.metadata.get('source_file', 'unknown')}` page {doc.metadata.get('page', '?')}"
+            for doc in context_docs
+        )
+        
+        # 2. Grading
+        crag_steps.append({
+            "title": "📋 Evaluating document relevance",
+            "status": "In progress...",
+            "details": "Grading each chunk using LLaMA..."
+        })
+        
+        relevant_docs = []
+        irrelevant_count = 0
+        grading_details = []
+        
+        for idx, doc in enumerate(context_docs, 1):
+            is_relevant = grade_document(grader_llm, question, doc.page_content)
+            status_str = "RELEVANT" if is_relevant else "IRRELEVANT"
+            grading_details.append(
+                f"**Chunk {idx}** (from `{doc.metadata.get('source_file')}` p.{doc.metadata.get('page')}): **{status_str}**\n\n"
+                f"*Snippet:* \"{doc.page_content[:150].strip()}...\""
+            )
+            if is_relevant:
+                relevant_docs.append(doc)
+            else:
+                irrelevant_count += 1
+                
+        crag_steps[-1]["status"] = f"Evaluation complete: {len(relevant_docs)} relevant, {irrelevant_count} irrelevant"
+        crag_steps[-1]["details"] = "\n\n---\n\n".join(grading_details)
+        
+        # 3. Action Decision
+        run_web_search = irrelevant_count > 0
+        
+        if run_web_search:
+            # We reformulate the query and run search to supplement/correct
+            crag_steps.append({
+                "title": "🧠 Reformulating search query",
+                "status": "In progress...",
+                "details": "Optimizing search query for web search..."
+            })
+            web_query = reformulate_query(grader_llm, question)
+            crag_steps[-1]["status"] = f"Optimized query: '{web_query}'"
+            crag_steps[-1]["details"] = f"Original question: '{question}'\n\nReformulated search query: **{web_query}**"
+            
+            crag_steps.append({
+                "title": "🌐 Executing web search",
+                "status": "In progress...",
+                "details": f"Searching DuckDuckGo for: '{web_query}'"
+            })
+            web_docs = execute_web_search(web_query, max_results=config.WEB_SEARCH_MAX_RESULTS)
+            crag_steps[-1]["status"] = f"Retrieved {len(web_docs)} web search result(s)"
+            crag_steps[-1]["details"] = "\n\n".join(
+                f"- [{d.metadata.get('title', 'Link')}]({d.metadata.get('url', '#')})" for d in web_docs
+            )
+            
+            all_context_docs = relevant_docs + web_docs
+        else:
+            all_context_docs = relevant_docs
+            
+    # 4. Generation
+    crag_steps.append({
+        "title": "✍️ Synthesizing final answer",
+        "status": "In progress...",
+        "details": f"Generating answer using {len(all_context_docs)} total document(s) in context."
+    })
+    
+    # Concatenate texts
+    context_text = "\n\n---\n\n".join(
+        f"[Source: '{doc.metadata.get('source_file', 'unknown')}', page {doc.metadata.get('page', '?')}]\n{doc.page_content}"
+        for doc in all_context_docs
+    )
+    
     messages = [
-        SystemMessage(content=config.SYSTEM_PROMPT),
+        SystemMessage(content=config.CRAG_SYSTEM_PROMPT),
         HumanMessage(
             content=(
                 f"Context:\n{context_text}\n\n"
@@ -192,22 +408,28 @@ def answer_question(question: str) -> dict:
             )
         ),
     ]
-
-    # Call Groq
-    llm = ChatGroq(
+    
+    generator_llm = ChatGroq(
         api_key=config.get_groq_api_key(),
         model=config.LLM_MODEL,
         temperature=0.2,
     )
-    response = llm.invoke(messages)
-
-    sources = [
-        {
+    response = generator_llm.invoke(messages)
+    
+    crag_steps[-1]["status"] = "Answer generated successfully"
+    crag_steps[-1]["details"] = f"Synthesis complete. Context size: {len(all_context_docs)} items."
+    
+    sources = []
+    for doc in all_context_docs:
+        sources.append({
             "file": doc.metadata.get("source_file", "unknown"),
             "page": doc.metadata.get("page", "?"),
             "snippet": doc.page_content[:200].replace("\n", " "),
-        }
-        for doc in context_docs
-    ]
-
-    return {"answer": response.content, "sources": sources}
+            "url": doc.metadata.get("url", None)
+        })
+    
+    return {
+        "answer": response.content,
+        "sources": sources,
+        "crag_steps": crag_steps
+    }

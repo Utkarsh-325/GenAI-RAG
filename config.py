@@ -40,14 +40,24 @@ CHUNK_SIZE        = 1000
 CHUNK_OVERLAP     = 200
 TOP_K_RESULTS     = 5
 
+# ── CRAG settings ─────────────────────────────────────────────────────────────
+WEB_SEARCH_MAX_RESULTS = 3
+CRAG_GRADER_TEMPERATURE = 0.0
+
 # ── Qdrant collection ─────────────────────────────────────────────────────────
 # A single shared collection lets you "upload once, chat many times".
 QDRANT_COLLECTION = "notebooklm_docs"
 
-# ── System prompt ─────────────────────────────────────────────────────────────
+# ── System prompts ────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = (
     "You are a helpful assistant. "
     "Answer the question ONLY using the provided context. "
     "If the answer is not in the context, say you don't know. "
     "Do not use outside knowledge."
+)
+
+CRAG_SYSTEM_PROMPT = (
+    "You are a helpful assistant. "
+    "Answer the question using the provided context, which includes both local documents and external web search results. "
+    "Answer the question accurately. If the context does not contain enough information to answer, state that you don't know."
 )
