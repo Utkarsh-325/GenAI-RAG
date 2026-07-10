@@ -147,13 +147,12 @@ def index_documents(chunks: List[Document]) -> int:
     _ensure_collection(client)
 
     logger.info("Indexing %d chunks into Qdrant …", len(chunks))
-    QdrantVectorStore.from_documents(
-        documents=chunks,
-        embedding=embeddings,
+    vector_store = QdrantVectorStore(
         client=client,
         collection_name=config.QDRANT_COLLECTION,
-        force_recreate=False,  # append to existing collection
+        embedding=embeddings,
     )
+    vector_store.add_documents(chunks)
     logger.info("Indexing complete.")
     return len(chunks)
 
