@@ -33,5 +33,5 @@ numpy>=1.26.0
 ddgs>=9.14.4
 
 # ── PyTorch (CPU only — install this FIRST separately to save ~700 MB) ────────
-# Run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+# Run: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 # Then: pip install -r requirements.txt
