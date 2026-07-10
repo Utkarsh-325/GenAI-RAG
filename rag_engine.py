@@ -272,7 +272,7 @@ def execute_web_search(query: str, max_results: int = 3) -> List[Document]:
     return documents
 
 
-def answer_question(question: str) -> dict:
+def answer_question(question: str, enable_web_search: bool = True) -> dict:
     """
     Corrective RAG (CRAG) flow:
       1. Retrieve relevant chunks from local vector store.
@@ -300,8 +300,17 @@ def answer_question(question: str) -> dict:
     )
     
     if not context_docs:
-        # If no documents are in Qdrant at all, we fallback to web search entirely
+        # If no documents are in Qdrant at all, we fallback to web search entirely (if enabled)
         crag_steps[-1]["status"] = "No local documents found"
+        
+        if not enable_web_search:
+            crag_steps[-1]["details"] = "Qdrant collection is empty or no documents returned. Web search is disabled by user configuration."
+            return {
+                "answer": "No local documents have been indexed yet, and web search fallback is disabled.",
+                "sources": [],
+                "crag_steps": crag_steps
+            }
+            
         crag_steps[-1]["details"] = "Qdrant collection is empty or no documents returned."
         
         web_query = reformulate_query(grader_llm, question)
@@ -357,8 +366,15 @@ def answer_question(question: str) -> dict:
         crag_steps[-1]["details"] = "\n\n---\n\n".join(grading_details)
         
         # 3. Action Decision
-        run_web_search = irrelevant_count > 0
+        run_web_search = (irrelevant_count > 0) and enable_web_search
         
+        if not enable_web_search and irrelevant_count > 0:
+            crag_steps.append({
+                "title": "🌐 Web search skipped",
+                "status": "Disabled by user",
+                "details": f"{irrelevant_count} chunk(s) graded as irrelevant, but web search fallback is disabled."
+            })
+            
         if run_web_search:
             # We reformulate the query and run search to supplement/correct
             crag_steps.append({

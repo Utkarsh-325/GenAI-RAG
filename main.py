@@ -110,6 +110,14 @@ with st.sidebar:
             st.markdown(f"- 📄 `{name}`")
 
     st.markdown("---")
+    st.markdown("### ⚙️ CRAG Settings")
+    enable_web = st.checkbox(
+        "🌐 Enable Web Fallback",
+        value=True,
+        help="If enabled, external search (DuckDuckGo) will be used to correct/supplement findings when local documents are insufficient."
+    )
+
+    st.markdown("---")
     st.markdown(
         "<small>Powered by **Groq** · **LLaMA 3.1 70B** · **Qdrant** · **HuggingFace Embeddings**</small>",
         unsafe_allow_html=True,
@@ -180,7 +188,7 @@ if submitted and user_input.strip():
     else:
         with st.spinner("Thinking …"):
             try:
-                answer_data = rag_engine.answer_question(question)
+                answer_data = rag_engine.answer_question(question, enable_web_search=enable_web)
             except Exception as exc:
                 answer_data = {"answer": f"❌ Error: {exc}", "sources": []}
 
